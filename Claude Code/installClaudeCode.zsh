@@ -4,42 +4,55 @@
 # Installs/updates: Homebrew, Azure CLI, ripgrep, Claude Code
 # Compatible with macOS 10.15+ (Intel & Apple Silicon)
 #
-# Jamf Pro note: policy scripts always execute as root. This script detects
-# that condition and re-launches itself as the current console user via
-# launchctl asuser + sudo -u, which gives Homebrew and npm the correct user
-# environment (HOME, PATH, npm prefix) they require.
+# Jamf Pro deployment pattern — LaunchAgent bootstrap
+# ─────────────────────────────────────────────────────
+# Jamf always runs policy scripts as root. Homebrew and npm cannot run as root.
+# sudo -u requires the user to have sudo rights (not viable for standard users).
+#
+# Solution: when running as root this script acts as a "loader":
+#   1. Writes the worker payload to /usr/local/jamf/scripts/
+#   2. Writes a LaunchAgent plist to /Library/LaunchAgents/
+#   3. Loads it with `launchctl bootstrap gui/<uid>` — launchd spawns the job
+#      directly in the user's session with no sudo or elevated privilege needed.
+#   4. The LaunchAgent self-destructs (unloads + deletes plist) on completion.
+#
+# Logs: /var/log/setup_dev_tools.log
 # =============================================================================
 
 set -euo pipefail
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+SCRIPT_DIR="/usr/local/jamf/scripts"
+WORKER_SCRIPT="${SCRIPT_DIR}/setup_dev_tools_worker.sh"
+PLIST_LABEL="com.company.setup-dev-tools"
+PLIST_PATH="/Library/LaunchAgents/${PLIST_LABEL}.plist"
+LOG_FILE="/var/log/setup_dev_tools.log"
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-log_info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
-log_ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
-log_error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
-log_section() { echo -e "\n${BOLD}══════════════════════════════════════════${RESET}"; \
-                echo -e "${BOLD}  $*${RESET}"; \
-                echo -e "${BOLD}══════════════════════════════════════════${RESET}"; }
+log_info()    { echo -e "$(date '+%F %T') ${CYAN}[INFO]${RESET}  $*" | tee -a "$LOG_FILE"; }
+log_ok()      { echo -e "$(date '+%F %T') ${GREEN}[OK]${RESET}    $*" | tee -a "$LOG_FILE"; }
+log_warn()    { echo -e "$(date '+%F %T') ${YELLOW}[WARN]${RESET}  $*" | tee -a "$LOG_FILE"; }
+log_error()   { echo -e "$(date '+%F %T') ${RED}[ERROR]${RESET} $*" | tee -a "$LOG_FILE" >&2; }
+log_section() {
+  echo -e "\n$(date '+%F %T') ${BOLD}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+  echo -e "$(date '+%F %T') ${BOLD}  $*${RESET}" | tee -a "$LOG_FILE"
+  echo -e "$(date '+%F %T') ${BOLD}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+}
 
-# ── Jamf-aware root re-exec ───────────────────────────────────────────────────
-# Jamf Pro runs all policy scripts as root regardless of the "Run As" setting.
-# Homebrew and npm global installs MUST run as the logged-in console user.
-#
-# Exit 126 root cause: Jamf writes the script to a root-owned temp path such as
-# /tmp/jamf.xxxxxx.sh which is not readable by the console user. Re-execing
-# bash "$0" as that user hits EACCES before a single line runs.
-#
-# Fix: copy the script to a user-owned temp file first, then re-exec from there.
-# After the child process exits we clean up and forward its exit code.
+# =============================================================================
+# ROOT BRANCH — Jamf context
+# Writes the worker + LaunchAgent and bootstraps it as the console user.
+# No sudo, no su, no elevated privilege required on the user side.
+# =============================================================================
 if [[ $EUID -eq 0 ]]; then
-  CONSOLE_USER="$(stat -f '%Su' /dev/console)"
 
+  # ── Identify the console user ───────────────────────────────────────────────
+  CONSOLE_USER="$(stat -f '%Su' /dev/console)"
   if [[ -z "$CONSOLE_USER" || "$CONSOLE_USER" == "root" ]]; then
-    log_error "No standard user is logged in at the console. Cannot continue."
-    log_error "Log in as a non-root user and re-run this policy."
+    log_error "No standard user is logged in at the console. Exiting."
     exit 1
   fi
 
@@ -47,116 +60,112 @@ if [[ $EUID -eq 0 ]]; then
   CONSOLE_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory \
                   | awk '{print $2}')"
 
-  log_info "Running as root — staging script for console user '${CONSOLE_USER}' (uid ${CONSOLE_UID})…"
+  log_info "Console user: ${CONSOLE_USER} (uid ${CONSOLE_UID}, home ${CONSOLE_HOME})"
 
-  # Write a user-readable copy of this script into the user's home tmp dir
-  USER_TMP="${CONSOLE_HOME}/.jamf_tmp"
-  mkdir -p "$USER_TMP"
-  TMPSCRIPT="${USER_TMP}/setup_dev_tools_$$.sh"
-  cp "$0" "$TMPSCRIPT"
-  chown "$CONSOLE_USER" "$TMPSCRIPT"
-  chmod 700 "$TMPSCRIPT"
+  # ── Touch log and make it writable by the user ─────────────────────────────
+  touch "$LOG_FILE"
+  chmod 666 "$LOG_FILE"
 
-  log_info "Re-launching as '${CONSOLE_USER}' via launchctl asuser…"
+  # ── Write worker script ─────────────────────────────────────────────────────
+  mkdir -p "$SCRIPT_DIR"
+  chmod 755 "$SCRIPT_DIR"
 
-  # launchctl asuser loads the user's launchd session (PATH, HOME, keychain).
-  # sudo -u runs within that session as the target user.
-  # NONINTERACTIVE=1 suppresses Homebrew prompts in the non-TTY context.
-  launchctl asuser "$CONSOLE_UID" \
-    sudo -u "$CONSOLE_USER" \
-    env NONINTERACTIVE=1 HOME="$CONSOLE_HOME" \
-    /bin/bash "$TMPSCRIPT" "$@"
-  EXIT_CODE=$?
+  cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
+#!/usr/bin/env bash
+# Worker — runs as console user via LaunchAgent. Never runs as root.
 
-  # Cleanup temp file
-  rm -f "$TMPSCRIPT"
-  rmdir "$USER_TMP" 2>/dev/null || true
+set -euo pipefail
 
-  exit $EXIT_CODE
-fi
+LOG_FILE="/var/log/setup_dev_tools.log"
+PLIST_LABEL="com.company.setup-dev-tools"
+PLIST_PATH="/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
-# ── From this point the script is guaranteed to run as a normal user ──────────
-# Export NONINTERACTIVE so Homebrew install doesn't prompt if running in a
-# non-interactive shell (e.g. launchctl-spawned child process).
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+log_info()    { echo -e "$(date '+%F %T') ${CYAN}[INFO]${RESET}  $*" | tee -a "$LOG_FILE"; }
+log_ok()      { echo -e "$(date '+%F %T') ${GREEN}[OK]${RESET}    $*" | tee -a "$LOG_FILE"; }
+log_warn()    { echo -e "$(date '+%F %T') ${YELLOW}[WARN]${RESET}  $*" | tee -a "$LOG_FILE"; }
+log_error()   { echo -e "$(date '+%F %T') ${RED}[ERROR]${RESET} $*" | tee -a "$LOG_FILE" >&2; }
+log_section() {
+  echo -e "\n$(date '+%F %T') ${BOLD}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+  echo -e "$(date '+%F %T') ${BOLD}  $*${RESET}" | tee -a "$LOG_FILE"
+  echo -e "$(date '+%F %T') ${BOLD}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+}
+
 export NONINTERACTIVE=1
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# =============================================================================
+# ===========================================================================
 # 1. HOMEBREW
-# =============================================================================
+# ===========================================================================
 log_section "Step 1 — Homebrew"
 
 if command -v brew &>/dev/null; then
   log_ok "Homebrew already installed at $(brew --prefix)"
   log_info "Updating Homebrew…"
   brew update
-  log_ok "Homebrew is up to date."
+  log_ok "Homebrew updated."
 else
-  log_info "Homebrew not found. Installing…"
+  log_info "Installing Homebrew…"
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-  # Add Homebrew to PATH for the remainder of this script (Apple Silicon default path)
   if [[ -x "/opt/homebrew/bin/brew" ]]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
   elif [[ -x "/usr/local/bin/brew" ]]; then
     eval "$(/usr/local/bin/brew shellenv)"
   fi
-
-  log_ok "Homebrew installed successfully."
+  log_ok "Homebrew installed."
 fi
 
-# =============================================================================
+# ===========================================================================
 # 2. AZURE CLI
-# =============================================================================
+# ===========================================================================
 log_section "Step 2 — Azure CLI"
 
 if brew list azure-cli &>/dev/null 2>&1; then
-  log_ok "azure-cli already installed ($(az version --query '"azure-cli"' -o tsv 2>/dev/null || echo 'version unknown'))."
-  log_info "Upgrading azure-cli if a newer version is available…"
-  brew upgrade azure-cli || log_warn "azure-cli is already at the latest version."
+  log_ok "azure-cli already installed."
+  brew upgrade azure-cli || log_warn "azure-cli already at latest version."
 else
-  log_info "Installing azure-cli via Homebrew…"
+  log_info "Installing azure-cli…"
   brew install azure-cli
-  log_ok "azure-cli installed: $(az version --query '"azure-cli"' -o tsv)"
+  log_ok "azure-cli installed."
 fi
 
-# =============================================================================
+# ===========================================================================
 # 3. RIPGREP
-# =============================================================================
+# ===========================================================================
 log_section "Step 3 — ripgrep"
 
 if brew list ripgrep &>/dev/null 2>&1; then
-  log_ok "ripgrep already installed ($(rg --version | head -1))."
-  log_info "Upgrading ripgrep if a newer version is available…"
-  brew upgrade ripgrep || log_warn "ripgrep is already at the latest version."
+  log_ok "ripgrep already installed."
+  brew upgrade ripgrep || log_warn "ripgrep already at latest version."
 else
-  log_info "Installing ripgrep via Homebrew…"
+  log_info "Installing ripgrep…"
   brew install ripgrep
-  log_ok "ripgrep installed: $(rg --version | head -1)"
+  log_ok "ripgrep installed."
 fi
 
-# =============================================================================
-# 4. NODE.JS (prerequisite for Claude Code)
-# =============================================================================
-log_section "Step 4a — Node.js (prerequisite for Claude Code)"
+# ===========================================================================
+# 4. NODE.JS
+# ===========================================================================
+log_section "Step 4a — Node.js"
 
-NODE_MIN_VERSION=18
+NODE_MIN=18
 
 install_or_upgrade_node() {
   if brew list node &>/dev/null 2>&1; then
-    log_info "Upgrading Node.js…"
-    brew upgrade node || log_warn "Node.js is already at the latest version."
+    brew upgrade node || log_warn "Node.js already at latest version."
   else
-    log_info "Installing Node.js via Homebrew…"
     brew install node
   fi
 }
 
 if command -v node &>/dev/null; then
-  NODE_VERSION=$(node --version | sed 's/v//' | cut -d. -f1)
-  if [[ "$NODE_VERSION" -ge "$NODE_MIN_VERSION" ]]; then
-    log_ok "Node.js $(node --version) satisfies the minimum requirement (v${NODE_MIN_VERSION}+)."
+  NODE_MAJOR=$(node --version | sed 's/v//' | cut -d. -f1)
+  if [[ "$NODE_MAJOR" -ge "$NODE_MIN" ]]; then
+    log_ok "Node.js $(node --version) meets requirement (v${NODE_MIN}+)."
   else
-    log_warn "Node.js $(node --version) is below v${NODE_MIN_VERSION}. Upgrading…"
+    log_warn "Node.js $(node --version) is too old. Upgrading…"
     install_or_upgrade_node
   fi
 else
@@ -164,100 +173,217 @@ else
   install_or_upgrade_node
 fi
 
-# Ensure the Homebrew-managed npm bin directory is in PATH
-NPM_BIN_DIR="$(npm bin -g 2>/dev/null || true)"
-if [[ -n "$NPM_BIN_DIR" && ":$PATH:" != *":$NPM_BIN_DIR:"* ]]; then
-  export PATH="$NPM_BIN_DIR:$PATH"
-fi
-
+NPM_BIN="$(npm bin -g 2>/dev/null || true)"
+[[ -n "$NPM_BIN" ]] && export PATH="${NPM_BIN}:$PATH"
 log_ok "Node.js $(node --version) | npm $(npm --version)"
 
-# =============================================================================
+# ===========================================================================
 # 5. CLAUDE CODE
-# =============================================================================
+# ===========================================================================
 log_section "Step 4b — Claude Code"
 
 CLAUDE_PKG="@anthropic-ai/claude-code"
-
-# Helper: get the installed global npm version of a package (empty if not installed)
-npm_global_version() {
-  npm list -g --depth=0 "$1" 2>/dev/null \
-    | grep "$1" \
-    | sed 's/.*@//' \
-    | tr -d ' ' \
-    || true
-}
-
-# ── Stale symlink / orphaned binary cleanup ───────────────────────────────────
-# When Homebrew previously managed a 'claude' formula (or a cask placed a
-# binary in the Homebrew prefix), it leaves a file at the Homebrew bin path
-# that npm refuses to overwrite (EEXIST).  We detect and remove it before
-# attempting any npm install/update.
 BREW_PREFIX="$(brew --prefix)"
 CLAUDE_BIN="${BREW_PREFIX}/bin/claude"
 
+# Stale symlink / orphaned binary cleanup
 if [[ -e "$CLAUDE_BIN" || -L "$CLAUDE_BIN" ]]; then
-  # Determine whether this is an npm-managed symlink or a Homebrew artifact
   if [[ -L "$CLAUDE_BIN" ]]; then
     LINK_TARGET="$(readlink "$CLAUDE_BIN")"
     if echo "$LINK_TARGET" | grep -q "node_modules"; then
-      log_ok "Existing claude symlink points to npm — no cleanup needed."
+      log_ok "Existing claude symlink is npm-managed — no cleanup needed."
     else
-      log_warn "Stale non-npm symlink found at ${CLAUDE_BIN}"
-      log_warn "  → points to: ${LINK_TARGET}"
-      log_info "Removing stale symlink so npm can install cleanly…"
+      log_warn "Stale symlink at ${CLAUDE_BIN} → ${LINK_TARGET}. Removing…"
       rm -f "$CLAUDE_BIN"
       log_ok "Stale symlink removed."
     fi
   else
-    # Regular file (e.g. a Homebrew-installed native binary)
-    log_warn "Homebrew-managed 'claude' binary found at ${CLAUDE_BIN}."
-    log_info "Unlinking via Homebrew (preferred) or removing directly…"
+    log_warn "Non-symlink file at ${CLAUDE_BIN}. Removing…"
     if brew list claude &>/dev/null 2>&1; then
-      brew unlink claude && log_ok "Unlinked Homebrew 'claude' formula."
+      brew unlink claude && log_ok "Unlinked Homebrew claude formula."
     else
-      rm -f "$CLAUDE_BIN"
-      log_ok "Removed orphaned binary at ${CLAUDE_BIN}."
+      rm -f "$CLAUDE_BIN" && log_ok "Removed orphaned binary."
     fi
   fi
 fi
 
-# ── Install / update ──────────────────────────────────────────────────────────
-INSTALLED_VERSION="$(npm_global_version "$CLAUDE_PKG")"
-LATEST_VERSION="$(npm view "$CLAUDE_PKG" version 2>/dev/null || true)"
+npm_global_version() {
+  npm list -g --depth=0 "$1" 2>/dev/null \
+    | grep "$1" | sed 's/.*@//' | tr -d ' ' || true
+}
 
-if [[ -z "$INSTALLED_VERSION" ]]; then
-  log_info "Claude Code not found in npm globals. Installing ${CLAUDE_PKG}@latest…"
-  # NOTE: Do NOT use sudo here — it causes permission issues with npm global installs
+INSTALLED="$(npm_global_version "$CLAUDE_PKG")"
+LATEST="$(npm view "$CLAUDE_PKG" version 2>/dev/null || true)"
+
+if [[ -z "$INSTALLED" ]]; then
+  log_info "Installing ${CLAUDE_PKG}…"
   npm install -g "$CLAUDE_PKG"
-  log_ok "Claude Code installed: $(claude --version 2>/dev/null || echo 'run "claude --version" after opening a new shell')"
+  log_ok "Claude Code installed: $(claude --version 2>/dev/null || echo 'open new shell to verify')"
+elif [[ -n "$LATEST" && "$INSTALLED" != "$LATEST" ]]; then
+  log_info "Updating Claude Code v${INSTALLED} → v${LATEST}…"
+  npm install -g "$CLAUDE_PKG"
+  log_ok "Claude Code updated to v${LATEST}."
 else
-  log_ok "Claude Code already installed (v${INSTALLED_VERSION})."
-  if [[ -n "$LATEST_VERSION" && "$INSTALLED_VERSION" != "$LATEST_VERSION" ]]; then
-    log_info "Update available: v${INSTALLED_VERSION} → v${LATEST_VERSION}. Updating…"
-    npm install -g "$CLAUDE_PKG"
-    log_ok "Claude Code updated to v${LATEST_VERSION}."
-  else
-    log_ok "Claude Code is already at the latest version (v${INSTALLED_VERSION})."
-  fi
+  log_ok "Claude Code v${INSTALLED} is already up to date."
+fi
+
+# ===========================================================================
+# SUMMARY
+# ===========================================================================
+log_section "Installation Summary"
+printf "$(date '+%F %T')   %-20s %s\n" "Homebrew"    "$(brew --version | head -1)"                                          | tee -a "$LOG_FILE"
+printf "$(date '+%F %T')   %-20s %s\n" "Azure CLI"   "$(az version --query '"azure-cli"' -o tsv 2>/dev/null || echo 'n/a')" | tee -a "$LOG_FILE"
+printf "$(date '+%F %T')   %-20s %s\n" "ripgrep"     "$(rg --version | head -1)"                                            | tee -a "$LOG_FILE"
+printf "$(date '+%F %T')   %-20s %s\n" "Node.js"     "$(node --version)"                                                    | tee -a "$LOG_FILE"
+printf "$(date '+%F %T')   %-20s %s\n" "npm"         "$(npm --version)"                                                     | tee -a "$LOG_FILE"
+printf "$(date '+%F %T')   %-20s %s\n" "Claude Code" "$(claude --version 2>/dev/null || echo 'open new shell')"             | tee -a "$LOG_FILE"
+log_ok "All tools installed and up to date."
+
+# ===========================================================================
+# SELF-DESTRUCT — unload and remove LaunchAgent so it never re-fires
+# ===========================================================================
+SELF_UID="$(id -u)"
+launchctl bootout "gui/${SELF_UID}/${PLIST_LABEL}" 2>/dev/null || true
+rm -f "$PLIST_PATH"
+log_info "LaunchAgent removed. Done."
+WORKER_EOF
+
+  chmod 755 "$WORKER_SCRIPT"
+  chown root "$WORKER_SCRIPT"
+
+  # ── Write the LaunchAgent plist ─────────────────────────────────────────────
+  cat > "$PLIST_PATH" << PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${WORKER_SCRIPT}</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${CONSOLE_HOME}</string>
+    <key>NONINTERACTIVE</key>
+    <string>1</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>${LOG_FILE}</string>
+
+  <key>StandardErrorPath</key>
+  <string>${LOG_FILE}</string>
+</dict>
+</plist>
+PLIST_EOF
+
+  chmod 644 "$PLIST_PATH"
+  chown root "$PLIST_PATH"
+
+  # ── Bootstrap into the user's gui session ───────────────────────────────────
+  # launchctl bootstrap loads the agent into the user's launchd session and
+  # fires it immediately. The user needs zero privileges for this to work —
+  # root is loading on their behalf.
+  log_info "Bootstrapping LaunchAgent for '${CONSOLE_USER}'…"
+  launchctl bootstrap "gui/${CONSOLE_UID}" "$PLIST_PATH"
+  log_ok "LaunchAgent loaded. Worker is running as '${CONSOLE_USER}'."
+  log_info "Monitor progress:  tail -f ${LOG_FILE}"
+
+  exit 0
 fi
 
 # =============================================================================
-# SUMMARY
+# USER BRANCH — direct / manual execution (not via Jamf)
+# Reached only when the script is run directly as a normal user.
 # =============================================================================
-log_section "Installation Summary"
-echo ""
-printf "  %-20s %s\n" "Tool"          "Version"
-printf "  %-20s %s\n" "────────────" "───────────────────"
-printf "  %-20s %s\n" "Homebrew"      "$(brew --version | head -1)"
-printf "  %-20s %s\n" "Azure CLI"     "$(az version --query '"azure-cli"' -o tsv 2>/dev/null || echo 'n/a')"
-printf "  %-20s %s\n" "ripgrep"       "$(rg --version | head -1)"
-printf "  %-20s %s\n" "Node.js"       "$(node --version)"
-printf "  %-20s %s\n" "npm"           "$(npm --version)"
-printf "  %-20s %s\n" "Claude Code"   "$(claude --version 2>/dev/null || echo 'open a new shell, then run: claude --version')"
-echo ""
-log_ok "All tools are installed and up to date."
-echo ""
-log_info "NEXT STEP: If 'claude' is not found, open a new terminal and run:"
-echo -e "           ${CYAN}claude${RESET}"
-echo ""
+
+export NONINTERACTIVE=1
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+log_section "Step 1 — Homebrew"
+if command -v brew &>/dev/null; then
+  log_ok "Homebrew already installed at $(brew --prefix)"
+  brew update && log_ok "Homebrew updated."
+else
+  log_info "Installing Homebrew…"
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  [[ -x "/opt/homebrew/bin/brew" ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+  [[ -x "/usr/local/bin/brew" ]]    && eval "$(/usr/local/bin/brew shellenv)"
+  log_ok "Homebrew installed."
+fi
+
+log_section "Step 2 — Azure CLI"
+if brew list azure-cli &>/dev/null 2>&1; then
+  brew upgrade azure-cli || log_warn "azure-cli already at latest."
+else
+  brew install azure-cli && log_ok "azure-cli installed."
+fi
+
+log_section "Step 3 — ripgrep"
+if brew list ripgrep &>/dev/null 2>&1; then
+  brew upgrade ripgrep || log_warn "ripgrep already at latest."
+else
+  brew install ripgrep && log_ok "ripgrep installed."
+fi
+
+log_section "Step 4a — Node.js"
+NODE_MIN=18
+install_or_upgrade_node() {
+  brew list node &>/dev/null 2>&1 && brew upgrade node || brew install node
+}
+if command -v node &>/dev/null; then
+  NODE_MAJOR=$(node --version | sed 's/v//' | cut -d. -f1)
+  [[ "$NODE_MAJOR" -lt "$NODE_MIN" ]] && install_or_upgrade_node \
+    || log_ok "Node.js $(node --version) OK."
+else
+  install_or_upgrade_node
+fi
+NPM_BIN="$(npm bin -g 2>/dev/null || true)"
+[[ -n "$NPM_BIN" ]] && export PATH="${NPM_BIN}:$PATH"
+
+log_section "Step 4b — Claude Code"
+CLAUDE_PKG="@anthropic-ai/claude-code"
+BREW_PREFIX="$(brew --prefix)"
+CLAUDE_BIN="${BREW_PREFIX}/bin/claude"
+if [[ -L "$CLAUDE_BIN" ]]; then
+  LINK_TARGET="$(readlink "$CLAUDE_BIN")"
+  echo "$LINK_TARGET" | grep -q "node_modules" || rm -f "$CLAUDE_BIN"
+elif [[ -e "$CLAUDE_BIN" ]]; then
+  brew list claude &>/dev/null 2>&1 && brew unlink claude || rm -f "$CLAUDE_BIN"
+fi
+npm_global_version() {
+  npm list -g --depth=0 "$1" 2>/dev/null | grep "$1" | sed 's/.*@//' | tr -d ' ' || true
+}
+INSTALLED="$(npm_global_version "$CLAUDE_PKG")"
+LATEST="$(npm view "$CLAUDE_PKG" version 2>/dev/null || true)"
+if [[ -z "$INSTALLED" ]]; then
+  npm install -g "$CLAUDE_PKG" && log_ok "Claude Code installed."
+elif [[ -n "$LATEST" && "$INSTALLED" != "$LATEST" ]]; then
+  npm install -g "$CLAUDE_PKG" && log_ok "Claude Code updated to v${LATEST}."
+else
+  log_ok "Claude Code v${INSTALLED} is up to date."
+fi
+
+log_section "Summary"
+printf "  %-20s %s\n" "Homebrew"    "$(brew --version | head -1)"
+printf "  %-20s %s\n" "Azure CLI"   "$(az version --query '"azure-cli"' -o tsv 2>/dev/null || echo 'n/a')"
+printf "  %-20s %s\n" "ripgrep"     "$(rg --version | head -1)"
+printf "  %-20s %s\n" "Node.js"     "$(node --version)"
+printf "  %-20s %s\n" "npm"         "$(npm --version)"
+printf "  %-20s %s\n" "Claude Code" "$(claude --version 2>/dev/null || echo 'open new shell')"
+log_ok "All tools installed and up to date."
