@@ -66,6 +66,44 @@ if [[ $EUID -eq 0 ]]; then
   touch "$LOG_FILE"
   chmod 666 "$LOG_FILE"
 
+  # ── Pre-create Homebrew prefix owned by the console user ───────────────────
+  # Homebrew's install script uses sudo internally to create its prefix
+  # directory and chown it to the current user. Standard users have no sudo,
+  # so that step fails with exit code 5.
+  #
+  # Fix: root pre-creates the prefix and chowns it to the console user here,
+  # while we still have root. When Homebrew's install script runs as the user
+  # and finds the prefix already exists and is already owned by them, it
+  # detects it is writable and skips the sudo chown step entirely.
+  #
+  # Apple Silicon prefix:  /opt/homebrew  (does not exist by default)
+  # Intel prefix:          /usr/local     (exists; Homebrew subdirs need user ownership)
+
+  ARCH="$(uname -m)"
+
+  if [[ "$ARCH" == "arm64" ]]; then
+    log_info "Apple Silicon detected — pre-creating /opt/homebrew for ${CONSOLE_USER}…"
+    if [[ ! -d "/opt/homebrew" ]]; then
+      mkdir -p "/opt/homebrew"
+      log_ok "Created /opt/homebrew"
+    else
+      log_info "/opt/homebrew already exists."
+    fi
+    chown -R "${CONSOLE_USER}:staff" "/opt/homebrew"
+    chmod -R 755 "/opt/homebrew"
+    log_ok "/opt/homebrew ownership set to ${CONSOLE_USER}."
+
+  else
+    log_info "Intel Mac detected — pre-creating /usr/local Homebrew subdirectories for ${CONSOLE_USER}…"
+    # Homebrew needs ownership of these specific subdirectories under /usr/local
+    for dir in bin etc include lib opt sbin share share/zsh share/zsh/site-functions \
+                var Frameworks Caskroom Cellar; do
+      mkdir -p "/usr/local/${dir}"
+      chown "${CONSOLE_USER}:admin" "/usr/local/${dir}"
+    done
+    log_ok "/usr/local Homebrew subdirectories ownership set to ${CONSOLE_USER}."
+  fi
+
   # ── Write worker script ─────────────────────────────────────────────────────
   mkdir -p "$SCRIPT_DIR"
   chmod 755 "$SCRIPT_DIR"
