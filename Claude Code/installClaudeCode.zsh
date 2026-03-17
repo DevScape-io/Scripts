@@ -26,10 +26,14 @@ log_section() { echo -e "\n${BOLD}═══════════════�
 
 # ── Jamf-aware root re-exec ───────────────────────────────────────────────────
 # Jamf Pro runs all policy scripts as root regardless of the "Run As" setting.
-# Homebrew and npm global installs must run as the logged-in user.
-# If we are root, find the current console user, then re-execute this entire
-# script as that user using launchctl asuser (which loads the user's launchd
-# session, giving access to the correct PATH, HOME, and environment).
+# Homebrew and npm global installs MUST run as the logged-in console user.
+#
+# Exit 126 root cause: Jamf writes the script to a root-owned temp path such as
+# /tmp/jamf.xxxxxx.sh which is not readable by the console user. Re-execing
+# bash "$0" as that user hits EACCES before a single line runs.
+#
+# Fix: copy the script to a user-owned temp file first, then re-exec from there.
+# After the child process exits we clean up and forward its exit code.
 if [[ $EUID -eq 0 ]]; then
   CONSOLE_USER="$(stat -f '%Su' /dev/console)"
 
@@ -40,14 +44,41 @@ if [[ $EUID -eq 0 ]]; then
   fi
 
   CONSOLE_UID="$(id -u "$CONSOLE_USER")"
-  log_info "Running as root — re-launching as console user '${CONSOLE_USER}' (uid ${CONSOLE_UID})…"
+  CONSOLE_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory \
+                  | awk '{print $2}')"
 
-  # launchctl asuser loads the user's login session; sudo -u runs the command
-  # as that user within that session, preserving HOME and environment.
-  exec launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" bash "$0" "$@"
+  log_info "Running as root — staging script for console user '${CONSOLE_USER}' (uid ${CONSOLE_UID})…"
+
+  # Write a user-readable copy of this script into the user's home tmp dir
+  USER_TMP="${CONSOLE_HOME}/.jamf_tmp"
+  mkdir -p "$USER_TMP"
+  TMPSCRIPT="${USER_TMP}/setup_dev_tools_$$.sh"
+  cp "$0" "$TMPSCRIPT"
+  chown "$CONSOLE_USER" "$TMPSCRIPT"
+  chmod 700 "$TMPSCRIPT"
+
+  log_info "Re-launching as '${CONSOLE_USER}' via launchctl asuser…"
+
+  # launchctl asuser loads the user's launchd session (PATH, HOME, keychain).
+  # sudo -u runs within that session as the target user.
+  # NONINTERACTIVE=1 suppresses Homebrew prompts in the non-TTY context.
+  launchctl asuser "$CONSOLE_UID" \
+    sudo -u "$CONSOLE_USER" \
+    env NONINTERACTIVE=1 HOME="$CONSOLE_HOME" \
+    /bin/bash "$TMPSCRIPT" "$@"
+  EXIT_CODE=$?
+
+  # Cleanup temp file
+  rm -f "$TMPSCRIPT"
+  rmdir "$USER_TMP" 2>/dev/null || true
+
+  exit $EXIT_CODE
 fi
 
 # ── From this point the script is guaranteed to run as a normal user ──────────
+# Export NONINTERACTIVE so Homebrew install doesn't prompt if running in a
+# non-interactive shell (e.g. launchctl-spawned child process).
+export NONINTERACTIVE=1
 
 # =============================================================================
 # 1. HOMEBREW
