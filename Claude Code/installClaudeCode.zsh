@@ -67,14 +67,22 @@ run_as_user() {
 ensure_homebrew() {
   section "Checking Homebrew"
 
-  if ! run_as_user 'command -v brew &>/dev/null'; then
+  # sudo -H spawns a non-login shell that does not source the user's .zprofile
+  # or .bash_profile, so 'command -v brew' will fail even when Homebrew is
+  # installed. Check the two well-known binary locations directly instead:
+  #   /opt/homebrew/bin/brew  — Apple Silicon (default since Homebrew 3.0)
+  #   /usr/local/bin/brew     — Intel Macs
+  if [[ -x "/opt/homebrew/bin/brew" ]]; then
+    BREW_BIN="/opt/homebrew/bin/brew"
+  elif [[ -x "/usr/local/bin/brew" ]]; then
+    BREW_BIN="/usr/local/bin/brew"
+  else
     error "Homebrew not installed. Install Homebrew first, then re-run this script."
   fi
 
-  log "Homebrew already installed."
+  log "Homebrew found at: $BREW_BIN"
 
-  # Ensure brew is on PATH for subsequent steps (Apple Silicon aware)
-  BREW_PREFIX=$(run_as_user 'brew --prefix 2>/dev/null || echo /usr/local')
+  BREW_PREFIX=$(run_as_user "$BREW_BIN --prefix")
   export PATH="$BREW_PREFIX/bin:$BREW_PREFIX/sbin:$PATH"
   log "Homebrew prefix: $BREW_PREFIX"
 }
@@ -86,14 +94,14 @@ brew_install_or_upgrade() {
   local formula="$1"
   log "Processing Homebrew formula: $formula"
 
-  if run_as_user "brew list --formula 2>/dev/null | grep -qx '${formula}'"; then
+  if run_as_user "$BREW_BIN list --formula 2>/dev/null | grep -qx '${formula}'"; then
     log "$formula is already installed — checking for updates..."
-    run_as_user "brew upgrade $formula 2>&1 | grep -v 'already installed'"  \
+    run_as_user "$BREW_BIN upgrade $formula 2>&1 | grep -v 'already installed'" \
       && log "$formula is up to date." \
       || warn "brew upgrade $formula exited non-zero (may already be current)."
   else
     log "$formula not found — installing..."
-    run_as_user "brew install $formula"
+    run_as_user "$BREW_BIN install $formula"
     log "$formula installed successfully."
   fi
 }
