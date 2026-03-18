@@ -9,7 +9,7 @@
 #
 # Requirements:
 #   - macOS 12 Monterey or later
-#   - Homebrew installed (script auto-installs it if missing)
+#   - Homebrew must already be installed
 #   - Internet access
 #
 # Usage:
@@ -26,16 +26,16 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
-log()    { echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S') $*"; }
-warn()   { echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
-error()  { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; exit 1; }
-section(){ echo; echo "========================================================"; echo "  $*"; echo "========================================================"; }
+log()     { echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S') $*"; }
+warn()    { echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
+error()   { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; exit 1; }
+section() { echo; echo "========================================================"; echo "  $*"; echo "========================================================"; }
 
 # ---------------------------------------------------------------------------
 # Detect the real user when running under Jamf (which runs as root)
 # ---------------------------------------------------------------------------
 detect_user() {
-  # Jamf sets the logged-in user as $3; fall back to console session query
+  # Jamf passes the logged-in user as $3; fall back to console session query
   REAL_USER="${3:-$(stat -f '%Su' /dev/console 2>/dev/null || echo '')}"
 
   if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
@@ -55,10 +55,12 @@ detect_user() {
 }
 
 # ---------------------------------------------------------------------------
-# Run a command as the real (non-root) user
+# Run a command as the real (non-root) user.
+# Uses -i (login shell) so the user's .zprofile / .bash_profile is sourced
+# and tools like Homebrew are on PATH.
 # ---------------------------------------------------------------------------
 run_as_user() {
-  sudo -H -u "$REAL_USER" bash -c "$*"
+  sudo -i -u "$REAL_USER" bash -c "$*"
 }
 
 # ---------------------------------------------------------------------------
@@ -67,17 +69,22 @@ run_as_user() {
 ensure_homebrew() {
   section "Checking Homebrew"
 
-  # sudo -H spawns a non-login shell that does not source the user's .zprofile
-  # or .bash_profile, so 'command -v brew' will fail even when Homebrew is
-  # installed. Check the two well-known binary locations directly instead:
-  #   /opt/homebrew/bin/brew  — Apple Silicon (default since Homebrew 3.0)
-  #   /usr/local/bin/brew     — Intel Macs
-  if [[ -x "/opt/homebrew/bin/brew" ]]; then
-    BREW_BIN="/opt/homebrew/bin/brew"
-  elif [[ -x "/usr/local/bin/brew" ]]; then
-    BREW_BIN="/usr/local/bin/brew"
-  else
-    error "Homebrew not installed. Install Homebrew first, then re-run this script."
+  # Try to locate brew three ways, in order of preference:
+  #   1. Login-shell PATH  (catches custom prefixes, nix-style installs, etc.)
+  #   2. /opt/homebrew     (Apple Silicon default)
+  #   3. /usr/local        (Intel default)
+  BREW_BIN=""
+
+  BREW_BIN=$(run_as_user 'which brew 2>/dev/null' || true)
+
+  if [[ -z "$BREW_BIN" || ! -x "$BREW_BIN" ]]; then
+    if   [[ -x "/opt/homebrew/bin/brew" ]]; then
+      BREW_BIN="/opt/homebrew/bin/brew"
+    elif [[ -x "/usr/local/bin/brew" ]]; then
+      BREW_BIN="/usr/local/bin/brew"
+    else
+      error "Homebrew not installed. Install Homebrew first, then re-run this script."
+    fi
   fi
 
   log "Homebrew found at: $BREW_BIN"
@@ -95,47 +102,44 @@ brew_install_or_upgrade() {
   log "Processing Homebrew formula: $formula"
 
   if run_as_user "$BREW_BIN list --formula 2>/dev/null | grep -qx '${formula}'"; then
-    log "$formula is already installed — checking for updates..."
+    log "$formula is already installed -- checking for updates..."
     run_as_user "$BREW_BIN upgrade $formula 2>&1 | grep -v 'already installed'" \
       && log "$formula is up to date." \
       || warn "brew upgrade $formula exited non-zero (may already be current)."
   else
-    log "$formula not found — installing..."
+    log "$formula not found -- installing..."
     run_as_user "$BREW_BIN install $formula"
     log "$formula installed successfully."
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Install or upgrade Claude Code (native binary — preferred method)
+# Install or upgrade Claude Code (native binary -- preferred method)
 # ---------------------------------------------------------------------------
 install_or_upgrade_claude_code() {
   section "Claude Code"
 
   if run_as_user 'command -v claude &>/dev/null'; then
-    log "Claude Code binary found — running self-update..."
-    # 'claude update' exits 0 even when already current
+    log "Claude Code binary found -- running self-update..."
     run_as_user 'claude update' \
       && log "Claude Code updated (or already current)." \
       || {
-          warn "'claude update' failed — falling back to native installer."
+          warn "'claude update' failed -- falling back to native installer."
           run_as_user 'curl -fsSL https://claude.ai/install.sh | bash'
           log "Claude Code re-installed via native installer."
         }
   else
-    log "Claude Code not found — installing via native installer..."
-    # The native installer requires no Node.js dependency and auto-updates
+    log "Claude Code not found -- installing via native installer..."
     run_as_user 'curl -fsSL https://claude.ai/install.sh | bash'
     log "Claude Code installed successfully."
   fi
 
-  # Print installed version for audit log
   CLAUDE_VERSION=$(run_as_user 'claude --version 2>/dev/null || echo unknown')
   log "Claude Code version: $CLAUDE_VERSION"
 }
 
 # ---------------------------------------------------------------------------
-# Verify all tools are present and emit versions for audit
+# Verify all tools are present and emit versions for audit log
 # ---------------------------------------------------------------------------
 verify_tools() {
   section "Verification"
@@ -144,9 +148,9 @@ verify_tools() {
   for tool in az rg claude; do
     if run_as_user "command -v $tool &>/dev/null"; then
       VERSION=$(run_as_user "$tool --version 2>/dev/null | head -1")
-      log "✓ $tool  →  $VERSION"
+      log "  [OK] $tool -> $VERSION"
     else
-      warn "✗ $tool not found on PATH after installation."
+      warn "  [FAIL] $tool not found on PATH after installation."
       all_ok=false
     fi
   done
@@ -161,27 +165,27 @@ verify_tools() {
 # =============================================================================
 main() {
   section "macOS Developer Tools Installer"
-  log "Script version : 1.0.0"
+  log "Script version : 1.1.0"
   log "macOS version  : $(sw_vers -productVersion)"
   log "Architecture   : $(uname -m)"
 
   detect_user
 
-  # ── 1. Homebrew ──────────────────────────────────────────────────────────
+  # 1. Homebrew
   ensure_homebrew
 
-  # ── 2. Azure CLI ─────────────────────────────────────────────────────────
+  # 2. Azure CLI
   section "Azure CLI"
   brew_install_or_upgrade "azure-cli"
 
-  # ── 3. ripgrep ───────────────────────────────────────────────────────────
+  # 3. ripgrep
   section "ripgrep"
   brew_install_or_upgrade "ripgrep"
 
-  # ── 4. Claude Code ───────────────────────────────────────────────────────
+  # 4. Claude Code
   install_or_upgrade_claude_code
 
-  # ── 5. Verification ──────────────────────────────────────────────────────
+  # 5. Verification
   verify_tools
 
   section "Complete"
