@@ -2,132 +2,131 @@
 # =============================================================================
 # setup_dev_tools.sh
 # Installs/updates: Azure CLI, ripgrep, Claude Code
-# Requires: Homebrew and Node.js already installed
-# Compatible with macOS 10.15+ (Intel & Apple Silicon)
-# Do NOT run as root — must run as the logged-in user
+#
+# Jamf Pro compatible — runs as root, executes tool commands as console user.
+# Prerequisites: Homebrew and Node.js (v18+) already deployed to the machine.
+#
+# Created by:   Patrick Howell — IT/Systems Engineering
+# Created:      2026-03-17
+# Last updated: 2026-03-17 v1.8
+# Log:          /var/log/setup_dev_tools.log
 # =============================================================================
 
 set -euo pipefail
 
 LOG_FILE="/var/log/setup_dev_tools.log"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+log()   { echo "$(date '+%F %T')  $*" | tee -a "$LOG_FILE"; }
+ok()    { log "[OK]    $*"; }
+info()  { log "[INFO]  $*"; }
+warn()  { log "[WARN]  $*"; }
+error() { log "[ERROR] $*" >&2; }
 
-log_info()    { echo -e "$(date '+%F %T') ${CYAN}[INFO]${RESET}  $*" | tee -a "$LOG_FILE"; }
-log_ok()      { echo -e "$(date '+%F %T') ${GREEN}[OK]${RESET}    $*" | tee -a "$LOG_FILE"; }
-log_warn()    { echo -e "$(date '+%F %T') ${YELLOW}[WARN]${RESET}  $*" | tee -a "$LOG_FILE"; }
-log_error()   { echo -e "$(date '+%F %T') ${RED}[ERROR]${RESET} $*" | tee -a "$LOG_FILE" >&2; }
-log_section() {
-  echo -e "\n$(date '+%F %T') ${BOLD}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
-  echo -e "$(date '+%F %T') ${BOLD}  $*${RESET}" | tee -a "$LOG_FILE"
-  echo -e "$(date '+%F %T') ${BOLD}══════════════════════════════════════════${RESET}" | tee -a "$LOG_FILE"
+# =============================================================================
+# Resolve the console user
+# Jamf runs scripts as root. We use `su - <user>` to run brew/npm commands
+# as the logged-in user. Root can su to any user without a password —
+# no sudo rights required from the target user.
+# =============================================================================
+CONSOLE_USER="$(stat -f '%Su' /dev/console)"
+
+if [[ -z "$CONSOLE_USER" || "$CONSOLE_USER" == "root" ]]; then
+  error "No standard user logged in at the console. Exiting."
+  exit 1
+fi
+
+info "Console user: ${CONSOLE_USER}"
+touch "$LOG_FILE"
+chmod 666 "$LOG_FILE"
+
+# Convenience wrapper — runs a command as the console user via su.
+# su from root requires no password and grants no elevated privileges.
+as_user() {
+  su - "$CONSOLE_USER" -c "$*"
 }
 
-# ── Guard ─────────────────────────────────────────────────────────────────────
-if [[ $EUID -eq 0 ]]; then
-  log_error "This script must not run as root. Run as the logged-in user."
+# =============================================================================
+# Verify prerequisites
+# =============================================================================
+if ! as_user "command -v brew" &>/dev/null; then
+  error "Homebrew not found for user ${CONSOLE_USER}. Deploy Homebrew first."
   exit 1
 fi
 
-# ── Ensure Homebrew is on PATH ────────────────────────────────────────────────
-if [[ -x "/opt/homebrew/bin/brew" ]]; then
-  eval "$(/opt/homebrew/bin/brew shellenv)"
-elif [[ -x "/usr/local/bin/brew" ]]; then
-  eval "$(/usr/local/bin/brew shellenv)"
-else
-  log_error "Homebrew not found. Install Homebrew first before running this script."
+if ! as_user "command -v npm" &>/dev/null; then
+  error "npm not found for user ${CONSOLE_USER}. Deploy Node.js (v18+) first."
   exit 1
 fi
-
-# ── Ensure npm is available ───────────────────────────────────────────────────
-if ! command -v npm &>/dev/null; then
-  log_error "npm not found. Ensure Node.js (v18+) is installed via Homebrew."
-  exit 1
-fi
-
-# Add npm global bin to PATH
-NPM_BIN="$(npm bin -g 2>/dev/null || true)"
-[[ -n "$NPM_BIN" ]] && export PATH="${NPM_BIN}:$PATH"
-
-touch "$LOG_FILE" 2>/dev/null || LOG_FILE="${TMPDIR}setup_dev_tools.log"
 
 # =============================================================================
 # 1. AZURE CLI
 # =============================================================================
-log_section "Step 1 — Azure CLI"
+info "--- Azure CLI ---"
 
-if brew list azure-cli &>/dev/null 2>&1; then
-  log_ok "azure-cli already installed."
-  brew upgrade azure-cli && log_ok "azure-cli upgraded." || log_warn "azure-cli already at latest version."
+if as_user "brew list azure-cli" &>/dev/null 2>&1; then
+  as_user "brew upgrade azure-cli" && ok "azure-cli upgraded." || warn "azure-cli already at latest version."
 else
-  log_info "Installing azure-cli…"
-  brew install azure-cli
-  log_ok "azure-cli installed: $(az version --query '"azure-cli"' -o tsv)"
+  info "Installing azure-cli…"
+  as_user "brew install azure-cli"
+  ok "azure-cli installed."
 fi
 
 # =============================================================================
 # 2. RIPGREP
 # =============================================================================
-log_section "Step 2 — ripgrep"
+info "--- ripgrep ---"
 
-if brew list ripgrep &>/dev/null 2>&1; then
-  log_ok "ripgrep already installed."
-  brew upgrade ripgrep && log_ok "ripgrep upgraded." || log_warn "ripgrep already at latest version."
+if as_user "brew list ripgrep" &>/dev/null 2>&1; then
+  as_user "brew upgrade ripgrep" && ok "ripgrep upgraded." || warn "ripgrep already at latest version."
 else
-  log_info "Installing ripgrep…"
-  brew install ripgrep
-  log_ok "ripgrep installed: $(rg --version | head -1)"
+  info "Installing ripgrep…"
+  as_user "brew install ripgrep"
+  ok "ripgrep installed."
 fi
 
 # =============================================================================
 # 3. CLAUDE CODE
 # =============================================================================
-log_section "Step 3 — Claude Code"
+info "--- Claude Code ---"
 
 CLAUDE_PKG="@anthropic-ai/claude-code"
-BREW_PREFIX="$(brew --prefix)"
+BREW_PREFIX="$(as_user 'brew --prefix')"
 CLAUDE_BIN="${BREW_PREFIX}/bin/claude"
 
-# Remove any stale Homebrew-placed binary/symlink that would block npm
+# Remove any stale non-npm binary/symlink at the Homebrew bin path that would
+# cause npm to error with EEXIST on install.
 if [[ -L "$CLAUDE_BIN" ]]; then
   LINK_TARGET="$(readlink "$CLAUDE_BIN")"
   if ! echo "$LINK_TARGET" | grep -q "node_modules"; then
-    log_warn "Stale symlink at ${CLAUDE_BIN} → ${LINK_TARGET}. Removing…"
+    warn "Stale symlink at ${CLAUDE_BIN} — removing."
     rm -f "$CLAUDE_BIN"
-    log_ok "Stale symlink removed."
   fi
 elif [[ -e "$CLAUDE_BIN" ]]; then
-  log_warn "Non-npm file at ${CLAUDE_BIN}. Removing…"
-  brew list claude &>/dev/null 2>&1 && brew unlink claude || rm -f "$CLAUDE_BIN"
-  log_ok "Removed."
+  warn "Non-npm file at ${CLAUDE_BIN} — removing."
+  rm -f "$CLAUDE_BIN"
 fi
 
-npm_global_version() {
-  npm list -g --depth=0 "$1" 2>/dev/null \
-    | grep "$1" | sed 's/.*@//' | tr -d ' ' || true
-}
-
-INSTALLED="$(npm_global_version "$CLAUDE_PKG")"
-LATEST="$(npm view "$CLAUDE_PKG" version 2>/dev/null || true)"
+INSTALLED="$(as_user "npm list -g --depth=0 ${CLAUDE_PKG} 2>/dev/null \
+  | grep ${CLAUDE_PKG} | sed 's/.*@//' | tr -d ' '" || true)"
+LATEST="$(as_user "npm view ${CLAUDE_PKG} version 2>/dev/null" || true)"
 
 if [[ -z "$INSTALLED" ]]; then
-  log_info "Installing Claude Code…"
-  npm install -g "$CLAUDE_PKG"
-  log_ok "Claude Code installed: $(claude --version 2>/dev/null || echo 'open a new shell to verify')"
+  info "Installing Claude Code…"
+  as_user "npm install -g ${CLAUDE_PKG}"
+  ok "Claude Code installed."
 elif [[ -n "$LATEST" && "$INSTALLED" != "$LATEST" ]]; then
-  log_info "Updating Claude Code v${INSTALLED} → v${LATEST}…"
-  npm install -g "$CLAUDE_PKG"
-  log_ok "Claude Code updated to v${LATEST}."
+  info "Updating Claude Code ${INSTALLED} → ${LATEST}…"
+  as_user "npm install -g ${CLAUDE_PKG}"
+  ok "Claude Code updated to ${LATEST}."
 else
-  log_ok "Claude Code v${INSTALLED} is already up to date."
+  ok "Claude Code ${INSTALLED} is already up to date."
 fi
 
 # =============================================================================
 # SUMMARY
 # =============================================================================
-log_section "Summary"
-printf "$(date '+%F %T')   %-20s %s\n" "Azure CLI"   "$(az version --query '"azure-cli"' -o tsv 2>/dev/null || echo 'n/a')" | tee -a "$LOG_FILE"
-printf "$(date '+%F %T')   %-20s %s\n" "ripgrep"     "$(rg --version | head -1)"                                            | tee -a "$LOG_FILE"
-printf "$(date '+%F %T')   %-20s %s\n" "Claude Code" "$(claude --version 2>/dev/null || echo 'open new shell to verify')"   | tee -a "$LOG_FILE"
-log_ok "Done."
+info "--- Summary ---"
+ok "Azure CLI   $(as_user 'az version --query "azure-cli" -o tsv' 2>/dev/null || echo 'n/a')"
+ok "ripgrep     $(as_user 'rg --version' | head -1)"
+ok "Claude Code $(as_user 'claude --version' 2>/dev/null || echo 'verify in a new terminal')"
+ok "All done."
