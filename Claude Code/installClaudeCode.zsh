@@ -67,15 +67,11 @@ run_as_user() {
 ensure_homebrew() {
   section "Checking Homebrew"
 
-  if run_as_user 'command -v brew &>/dev/null'; then
-    log "Homebrew already installed."
-  else
-    log "Homebrew not found — installing..."
-    run_as_user \
-      'NONINTERACTIVE=1 /bin/bash -c \
-       "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-    log "Homebrew installed successfully."
+  if ! run_as_user 'command -v brew &>/dev/null'; then
+    error "Homebrew not installed. Install Homebrew first, then re-run this script."
   fi
+
+  log "Homebrew already installed."
 
   # Ensure brew is on PATH for subsequent steps (Apple Silicon aware)
   BREW_PREFIX=$(run_as_user 'brew --prefix 2>/dev/null || echo /usr/local')
