@@ -157,52 +157,22 @@ brew_install_or_upgrade() {
 }
 
 # ---------------------------------------------------------------------------
-# Install or upgrade Claude Code (native binary)
-# After install, symlink into /usr/local/bin so it is always on PATH
-# regardless of shell profile state.
+# Install or upgrade Claude Code via Homebrew cask
 # ---------------------------------------------------------------------------
 install_or_upgrade_claude_code() {
   section "Claude Code"
 
-  local claude_bin="$REAL_HOME/.claude/bin/claude"
-
-  if [[ -x "$claude_bin" ]]; then
-    log "Claude Code found at $claude_bin -- updating..."
-    run_as_user 'claude update' \
-      && log "Claude Code updated (or already current)." \
-      || {
-          warn "'claude update' failed -- re-running native installer."
-          run_as_user 'curl -fsSL https://claude.ai/install.sh | bash'
-        }
+  if run_as_user "$BREW_BIN list --cask 2>/dev/null | grep -qx 'claude-code'"; then
+    log "claude-code cask already installed -- upgrading if needed..."
+    run_as_user "$BREW_BIN upgrade --cask claude-code"       && log "claude-code upgraded."       || log "claude-code already at latest version."
   else
-    log "Claude Code not found -- installing via native installer..."
-    run_as_user 'curl -fsSL https://claude.ai/install.sh | bash'
-    log "Claude Code installed."
-  fi
-
-  # Symlink claude into /usr/local/bin so it is on PATH immediately in all
-  # terminal sessions without needing to reload the shell profile.
-  if [[ -x "$claude_bin" ]]; then
-    ln -sf "$claude_bin" /usr/local/bin/claude
-    log "Symlinked $claude_bin -> /usr/local/bin/claude"
-  else
-    warn "Could not find claude binary at $claude_bin after install."
-  fi
-
-  # Also ensure ~/.claude/bin is in the user's .zprofile for completeness.
-  local zprofile="$REAL_HOME/.zprofile"
-  if ! grep -qF '.claude/bin' "$zprofile" 2>/dev/null; then
-    log "Adding ~/.claude/bin to PATH in $zprofile"
-    echo "" >> "$zprofile"
-    echo "# Claude Code" >> "$zprofile"
-    echo 'export PATH="$HOME/.claude/bin:$PATH"' >> "$zprofile"
-    chown "$REAL_USER" "$zprofile"
-  else
-    log "Claude Code PATH already in $zprofile"
+    log "claude-code cask not found -- installing..."
+    run_as_user "$BREW_BIN install --cask claude-code"
+    log "claude-code installed."
   fi
 
   local version
-  version=$(/usr/local/bin/claude --version 2>/dev/null | head -1 || echo "unknown")
+  version=$(run_as_user 'claude --version 2>/dev/null | head -1' || echo "unknown")
   log "Claude Code version: $version"
 }
 
@@ -217,7 +187,7 @@ verify_tools() {
   declare -A TOOL_PATHS=(
     ["az"]="$BREW_PREFIX/bin/az"
     ["rg"]="$BREW_PREFIX/bin/rg"
-    ["claude"]="/usr/local/bin/claude"
+    ["claude"]="$BREW_PREFIX/bin/claude"
   )
 
   for tool in az rg claude; do
@@ -242,7 +212,7 @@ verify_tools() {
 # =============================================================================
 main() {
   section "macOS Developer Tools Installer"
-  log "Script version : 1.2.0"
+  log "Script version : 1.3.0"
   log "macOS version  : $(sw_vers -productVersion)"
   log "Architecture   : $(uname -m)"
 
