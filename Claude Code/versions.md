@@ -1,1 +1,0 @@
-v1.2 — 2026-03-17 — Replaced re-exec/sudo approach with LaunchAgent bootstrap pattern. Resolves exit 126 (permission denied) for standard users without sudo rights. Root writes worker + plist, bootstraps via launchctl into the user's gui session. Worker self-destructs on completion.
