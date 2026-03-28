@@ -81,7 +81,7 @@ if systemctl is-active --quiet NetworkManager 2>/dev/null; then
     nmcli con up "$CONN_NAME" || warn "Could not bring up connection immediately — will apply on next boot."
     log "Static IP configured via NetworkManager."
 
-elif command -v dhcpcd &>/dev/null; then
+elif systemctl list-unit-files dhcpcd.service 2>/dev/null | grep -q dhcpcd; then
     info "dhcpcd detected — configuring via /etc/dhcpcd.conf."
 
     DHCPCD_CONF="/etc/dhcpcd.conf"
@@ -131,18 +131,31 @@ section "3 · DHCP & DNS forwarding (dnsmasq)"
 
 apt-get install -y dnsmasq
 
-# Disable systemd-resolved if it's occupying port 53
-if ss -tulnp 2>/dev/null | grep -q ':53 '; then
-    warn "Port 53 is in use — disabling systemd-resolved."
-    systemctl stop systemd-resolved  2>/dev/null || true
-    systemctl disable systemd-resolved 2>/dev/null || true
-    # Remove the stub resolver symlink
-    rm -f /etc/resolv.conf
-    cat > /etc/resolv.conf <<EOF
+# Always disable systemd-resolved — conflicts with dnsmasq on port 53
+# and can be re-enabled by DHCP/NetworkManager if not fully stopped
+log "Disabling systemd-resolved (conflicts with dnsmasq)..."
+systemctl stop systemd-resolved    2>/dev/null || true
+systemctl disable systemd-resolved 2>/dev/null || true
+systemctl mask systemd-resolved    2>/dev/null || true   # mask prevents any re-enable
+
+# Remove the stub resolver symlink and write a static resolv.conf
+rm -f /etc/resolv.conf
+cat > /etc/resolv.conf <<EOF
 nameserver ${DNS_UPSTREAM_1}
 nameserver ${DNS_UPSTREAM_2}
 EOF
-    chattr +i /etc/resolv.conf   # prevent overwrite
+chattr +i /etc/resolv.conf   # immutable — DHCP clients cannot overwrite this
+
+# Tell NetworkManager to manage DNS itself rather than handing off to systemd-resolved
+if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/no-resolved.conf <<NM_EOF
+[main]
+dns=none
+systemd-resolved=false
+NM_EOF
+    systemctl reload NetworkManager 2>/dev/null || true
+    log "NetworkManager configured to not use systemd-resolved."
 fi
 
 # Backup existing config
