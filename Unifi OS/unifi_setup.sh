@@ -208,35 +208,46 @@ else
     info "Java 17+ already present — skipping."
 fi
 
-# MongoDB (required by UniFi; use 4.4 for ARM64/amd64)
+# MongoDB 7.0 (required by UniFi 8.x; supports Ubuntu 24.04 Noble via jammy repo)
 if ! command -v mongod &>/dev/null; then
-    log "Adding MongoDB 4.4 repository..."
+    log "Adding MongoDB 7.0 repository..."
 
     ARCH=$(dpkg --print-architecture)
     CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
 
-    # MongoDB 4.4 is the last version with arm64 + amd64 parity on Debian/Ubuntu
-    curl -fsSL https://www.mongodb.org/static/pgp/server-4.4.asc \
-        | gpg --dearmor -o /usr/share/keyrings/mongodb-server-4.4.gpg
+    # Remove any stale MongoDB repo files
+    rm -f /etc/apt/sources.list.d/mongodb-org-4.4.list
+    rm -f /usr/share/keyrings/mongodb-server-4.4.gpg
 
-    # Map any Debian/Ubuntu codename to the closest supported MongoDB base
+    # MongoDB 7.0 has no Noble (24.04) package yet — jammy works on Noble fine
     case "$CODENAME" in
-        bookworm|bullseye|buster)  MONGO_DIST="bullseye" ;;
-        jammy|focal|bionic)        MONGO_DIST="focal"    ;;
-        *)                         MONGO_DIST="focal"    ;;
+        noble|jammy|focal)         MONGO_DIST="jammy" ;;
+        bookworm|bullseye|buster)  MONGO_DIST="jammy" ;;
+        *)                         MONGO_DIST="jammy" ;;
     esac
 
-    echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/mongodb-server-4.4.gpg] \
-https://repo.mongodb.org/apt/debian ${MONGO_DIST}/mongodb-org/4.4 main" \
-        | tee /etc/apt/sources.list.d/mongodb-org-4.4.list
+    curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc \
+        | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+
+    echo "deb [ arch=${ARCH} signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] \
+https://repo.mongodb.org/apt/ubuntu ${MONGO_DIST}/mongodb-org/7.0 multiverse" \
+        | tee /etc/apt/sources.list.d/mongodb-org-7.0.list
 
     apt-get update -y
     apt-get install -y mongodb-org
     systemctl enable mongod
     systemctl start mongod
-    log "MongoDB 4.4 installed."
+
+    # Give mongod a moment to fully start before UniFi tries to connect
+    sleep 3
+    if systemctl is-active --quiet mongod; then
+        log "MongoDB 7.0 installed and running."
+    else
+        error "MongoDB failed to start. Run: journalctl -xeu mongod.service"
+    fi
 else
     info "mongod already installed — skipping."
+    systemctl is-active --quiet mongod || systemctl start mongod
 fi
 
 # UniFi Network Application
