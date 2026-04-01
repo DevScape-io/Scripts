@@ -18,6 +18,10 @@ warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 die()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 sep()     { echo -e "${DIM}----------------------------------------------------${RESET}"; }
 
+# Force stdin from terminal so read always waits for user input
+# (handles curl|bash, piped installs, and some sudo configurations)
+exec < /dev/tty
+
 # ── Root check ───────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     die "Run as root:  sudo $0"
@@ -208,7 +212,7 @@ prompt_field() {
             echo -ne "${BOLD}  ${PF_LABEL}${RESET}: "
         fi
 
-        read -r PF_INPUT || PF_INPUT=""
+        read -r PF_INPUT </dev/tty || PF_INPUT=""
 
         if [ -z "$PF_INPUT" ]; then
             PF_INPUT="$PF_CURRENT"
@@ -443,7 +447,7 @@ if [ "$IS_REMOTE" = "true" ]; then
 fi
 
 echo -ne "${YELLOW}${BOLD}  Apply these settings? [y/N]: ${RESET}"
-read -r CONFIRM || CONFIRM=""
+read -r CONFIRM </dev/tty || CONFIRM=""
 if [ "${CONFIRM}" != "y" ] && [ "${CONFIRM}" != "Y" ]; then
     info "Aborted -- no changes written."
     exit 0
