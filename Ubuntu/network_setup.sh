@@ -172,8 +172,9 @@ prompt_field() {
 echo -e "${BOLD}── Step 1 · Hostname ─────────────────────────────────${RESET}"
 CURRENT_HOSTNAME=$(hostname)
 prompt_field NEW_HOSTNAME "Hostname" "$CURRENT_HOSTNAME"
-[[ $NEW_HOSTNAME =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$ ]] \
-    || die "Invalid hostname '$NEW_HOSTNAME'. Use letters, numbers, hyphens only."
+if ! [[ $NEW_HOSTNAME =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$ ]]; then
+    die "Invalid hostname '$NEW_HOSTNAME'. Use letters, numbers, hyphens only."
+fi
 echo
 
 # ── STEP 2 · Interface ───────────────────────────────────────
@@ -214,8 +215,7 @@ done
 
 while true; do
     prompt_field IFACE_CHOICE "Select interface number" "$DEFAULT_IDX"
-    if [[ $IFACE_CHOICE =~ ^[0-9]+$ ]] \
-        && (( IFACE_CHOICE >= 1 && IFACE_CHOICE <= ${#IFACES[@]} )); then
+    if [[ $IFACE_CHOICE =~ ^[0-9]+$ ]] && (( IFACE_CHOICE >= 1 && IFACE_CHOICE <= ${#IFACES[@]} )); then
         IFACE="${IFACES[$((IFACE_CHOICE-1))]}"; break
     fi
     warn "  Invalid selection."
@@ -343,8 +343,7 @@ apply_hostname() {
     echo "$NEW_HOSTNAME" > /etc/hostname
     hostname "$NEW_HOSTNAME"
     sed -i "s/\b${CURRENT_HOSTNAME}\b/${NEW_HOSTNAME}/g" /etc/hosts
-    grep -q "127.0.1.1" /etc/hosts \
-        || echo "127.0.1.1  ${NEW_HOSTNAME}" >> /etc/hosts
+    grep -q "127.0.1.1" /etc/hosts || echo "127.0.1.1  ${NEW_HOSTNAME}" >> /etc/hosts
     success "Hostname updated."
 }
 
